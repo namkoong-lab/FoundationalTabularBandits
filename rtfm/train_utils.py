@@ -289,8 +289,11 @@ def train(
                     batch[key] = batch[key].to("xpu:{local_rank}")
                 else:
                     batch[key] = batch[key].to(f"cuda:{local_rank}")
-        with autocast():
-            loss = model(**batch).loss
+        # Add this to avoid error ValueError: AttentionMaskConverter._unmask_unattended expects a float `expanded_mask`, got a BoolTensor.
+        # Something wrong with autocast
+        if "attention_mask" in batch:
+            batch["attention_mask"] = batch["attention_mask"].to(torch.bfloat16)
+        loss = model(**batch).loss
         loss = loss / gradient_accumulation_steps
 
         if train_config.use_fp16:

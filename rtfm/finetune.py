@@ -47,6 +47,7 @@ from rtfm.configs import (
     LoraConfig,
     TokenizerConfig,
     SerializerConfig,
+    WandbCLIConfig
 )
 from rtfm.data import (
     prepare_tokenized_dataset,
@@ -93,6 +94,7 @@ def main(
     data_arguments: DataArguments,
     tokenizer_config: TokenizerConfig,
     serializer_config: SerializerConfig,
+    wandb_cli_config: WandbCLIConfig,
     train_task_file: str,
     eval_task_file: Optional[str] = None,
 ):
@@ -153,7 +155,11 @@ def main(
             **dataclasses.asdict(tokenizer_config),
         }
         if not train_config.enable_fsdp or rank == 0:
-            wandb_run = setup_wandb(config_dict=config_dict)
+            wandb_run = setup_wandb(
+                config_dict=config_dict,
+                project=wandb_cli_config.wandb_project,
+                entity=wandb_cli_config.wandb_entity
+            )
 
     # Load the pre-trained model and setup its configuration
     use_cache = False if train_config.enable_fsdp else None
@@ -435,6 +441,7 @@ if __name__ == "__main__":
             DataArguments,
             TokenizerConfig,
             SerializerConfig,
+            WandbCLIConfig,
         )
     )
 
@@ -449,6 +456,7 @@ if __name__ == "__main__":
         data_arguments,
         tokenizer_config,
         serializer_config,
+        wandb_cli_config,
         other_args,
     ) = parser.parse_args_into_dataclasses()
 
@@ -459,5 +467,6 @@ if __name__ == "__main__":
         data_arguments=data_arguments,
         tokenizer_config=tokenizer_config,
         serializer_config=serializer_config,
+        wandb_cli_config=wandb_cli_config, 
         **vars(other_args),
     )
