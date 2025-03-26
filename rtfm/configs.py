@@ -262,3 +262,8 @@ class FsdpConfig:
     def __post_init__(self):
         if isinstance(self.sharding_strategy, str):
             self.sharding_strategy = eval("ShardingStrategy." + self.sharding_strategy)
+
+@dataclass
+class WandbCLIConfig:
+    wandb_project: Optional[str] = field(default="project_name")
+    wandb_entity: Optional[str] = field(default="entity_name")

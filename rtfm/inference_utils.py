@@ -1,8 +1,10 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Literal, Any
+from typing import List, Optional, Literal, Any, Dict
 
+import math
+import torch
 import numpy as np
 import pandas as pd
 import transformers
@@ -211,12 +213,16 @@ def infer_on_example(
 
     # Generate and decode
     stopping_criterion = make_eoc_stopping_criterion(input_ids, tokenizer)
-    output = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        stopping_criteria=[stopping_criterion],
-    )
+    # Explicitly adding eos_token_id otherwise there's a bug in identifying the eoc_stopping_criterion that causes generation until max context length
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            stopping_criteria=[stopping_criterion],
+            eos_token_id=128256,
+            use_cache=True
+        )
     decoded_text = tokenizer.batch_decode(output)[0].strip()
     prediction_text, is_valid = parse_generated_text(decoded_text)
 
@@ -237,6 +243,220 @@ def infer_on_example(
             f"unknown value for handle_invalid_predictions: {handle_invalid_predictions}"
         )
 
+def infer_label_distribution_on_example(
+    model,
+    tokenizer,
+    serializer: RowSerializer,
+    target_example: pd.DataFrame,
+    target_colname: str,
+    target_choices: List[str],
+    labeled_examples: Optional[pd.DataFrame] = None,
+    cfg: Optional[TLMConfig] = None
+) -> Dict[str, float]:
+    """
+    Computes a probability distribution over the provided `target_choices` by
+    summing the model's log-probabilities for each token of each label.
+
+    Parameters
+    ----------
+    model : AutoModelForCausalLM
+        The (Tabula-fine-tuned) model used for inference.
+    tokenizer : PreTrainedTokenizer
+        The tokenizer associated with the model.
+    serializer : RowSerializer
+        The same serializer used for training/fine-tuning Tabula. 
+    target_example : pd.DataFrame
+        A single-row dataframe with the features for inference.
+    target_colname : str
+        The column to predict (e.g., "weather").
+    target_choices : List[str]
+        The list of candidate labels (e.g., ["sun", "rain", "snow"]).
+    labeled_examples : pd.DataFrame, optional
+        Few-shot examples if desired. 
+    cfg : TLMConfig, optional
+        Controls any Tabula-specific serialization config. If None, a default is created.
+    device : str
+        Which device to run on ("cuda" or "cpu").
+    handle_invalid_predictions : "raise", "warn", or None
+        Same usage as in `infer_on_example`—only relevant if the model fails 
+        to produce the <|endcompletion|> token, though typically we skip generation here anyway.
+
+    Returns
+    -------
+    Dict[str, float]
+        A dictionary mapping each label to a normalized probability.
+    """
+    # ----------------------------------
+    # 1. Basic checks and setup
+    # ----------------------------------
+    is_fewshot = labeled_examples is not None
+    disable_progress_bar()
+
+    if len(target_example) != 1:
+        raise ValueError("Only use one example at a time for inference.")
+
+    if target_colname not in target_example.columns:
+        logging.warning(
+            f"Column {target_colname} is not in target example; "
+            f"got columns {target_example.columns}. Adding a dummy placeholder "
+            "with empty values for preprocessing. This is fine if your target "
+            "samples do not contain the target column at inference."
+        )
+        target_example[target_colname] = np.nan
+
+    if is_fewshot:
+        if target_colname not in labeled_examples.columns:
+            raise ValueError(
+                f"Expected column {target_colname} in labeled examples; "
+                f"got columns {labeled_examples.columns}"
+            )
+
+    data_arguments = DataArguments(
+        use_config=True,
+        feature_value_handling="none",
+        feature_name_handling="none",
+        targets_handling="none",
+    )
+
+    if cfg is None:
+        cfg = TLMConfig(
+            prefix=f"Predict the {target_colname}",
+            suffix=f"What is the value of {target_colname}?",
+            label_values=target_choices,
+        )
+
+    # ----------------------------------
+    # 2. Build the dataset(s)
+    # ----------------------------------
+    if is_fewshot:
+        ds_dict = {
+            "train": prepare_dataframe(labeled_examples, target_colname, data_arguments),
+            "test": prepare_dataframe(target_example, target_colname, data_arguments),
+        }
+    else:
+        ds_dict = {
+            "test": prepare_dataframe(target_example, target_colname, data_arguments),
+        }
+
+    # 2a) Serialize (turn rows -> text) 
+    ds_dict = {
+        split: serialize_dataset_fn(ds, data_args=data_arguments, serializer=serializer, cfg=cfg)
+        for split, ds in ds_dict.items()
+    }
+    # 2b) Add QA + EOC tokens
+    ds_dict = {
+        split: ds.map(add_qa_and_eoc_tokens_to_example)
+        for split, ds in ds_dict.items()
+    }
+    # 2c) Tokenize
+    tokenized_ds_dict = tokenize_ds_dict(ds_dict, tokenizer=tokenizer, data_arguments=data_arguments)
+
+    # ----------------------------------
+    # 3. Construct few-shot sample
+    # ----------------------------------
+    if is_fewshot:
+        ds_train = tokenized_ds_dict["train"]
+        # We'll grab as many labeled examples as provided
+        shots = list(
+            ds_train.select_columns(["input_ids", "labels"]).with_format("torch").take(len(labeled_examples))
+        )
+        # Turn them into a list of (input_ids, labels)
+        shots = [(x["input_ids"], x["labels"]) for x in shots]
+    else:
+        shots = None
+
+    ds_test = tokenized_ds_dict["test"]
+    target_sample = list(
+        ds_test.select_columns(["input_ids", "labels"]).with_format("torch").take(1)
+    )[0]
+    target_sample = (target_sample["input_ids"], target_sample["labels"])
+
+    enable_progress_bar()
+
+    # 3a) Combine few-shot examples + target example into final prompt
+    input_ids, labels = make_few_shot_sample(
+        shots=shots, 
+        target_sample=target_sample,
+        max_len=tokenizer.model_max_length
+    )
+
+    # ----------------------------------
+    # 4. Build batch & push to device
+    # ----------------------------------
+    data_collator = DataCollatorForSupervisedDataset(tokenizer)
+    batch = data_collator([{"input_ids": input_ids, "labels": labels}])
+
+    # We'll skip calling .generate(), so no need to worry about max_new_tokens 
+    # beyond ensuring we haven't exceeded context length. 
+    total_tokens = batch["input_ids"].numel()
+    available_context_window_tokens = tokenizer.model_max_length - total_tokens
+    if available_context_window_tokens < 2:
+        raise ValueError(
+            f"Not enough remaining context tokens to add any label. "
+            f"After serialization, the input example is {total_tokens} tokens."
+        )
+
+    batch = batch_to_xpu(batch)
+    input_ids, attention_mask = prepare_input_ids_and_attention_mask_for_generation(batch)
+
+    prompt_len = input_ids.shape[1]  # The number of tokens in the prompt portion
+
+    # ----------------------------------
+    # 5. For each candidate label, compute log-likelihood
+    # ----------------------------------
+    label2logp = {}
+
+    for label_str in target_choices:
+        # We append the label + <|endcompletion|> to see how probable it is
+        # exactly.  If your model uses a different special token for EOC,
+        # adapt accordingly.
+        label_plus_eoc = label_str + "<|endcompletion|>"
+        label_tokens = tokenizer(label_plus_eoc, add_special_tokens=False, return_tensors="pt")
+
+        # Move the label tokens to device
+        label_tokens = batch_to_xpu(label_tokens)
+        label_input_ids = label_tokens["input_ids"]
+        label_attention_mask = label_tokens["attention_mask"]
+
+        # Concatenate with the existing prompt
+        full_input_ids = torch.cat([input_ids, label_input_ids], dim=1)
+        full_attention_mask = torch.cat([attention_mask, label_attention_mask], dim=1)
+
+        # We want to compute the cross-entropy on these newly added tokens
+        # but *not* on the prompt portion. So we create a labels tensor 
+        # that is -100 for the prompt portion.
+        labels_for_loss = torch.full_like(full_input_ids, -100)
+        # The label portion is from `prompt_len` onward
+        labels_for_loss[:, prompt_len:] = full_input_ids[:, prompt_len:]
+
+        # Teacher-forcing forward pass
+        with torch.no_grad():
+            outputs = model(
+                input_ids=full_input_ids,
+                attention_mask=full_attention_mask,
+                labels=labels_for_loss,
+            )
+        # outputs.loss is the average cross-entropy over the label tokens
+        n_label_tokens = label_input_ids.shape[1]
+        neg_log_likelihood = outputs.loss * n_label_tokens  # Un-normalized NLL to get sum(log(p))
+        logp = -neg_log_likelihood.item()  # Flip sign to get the log-probability
+
+        label2logp[label_str] = logp
+
+    # ----------------------------------
+    # 6. Convert log-probs to normalized probabilities
+    # ----------------------------------
+    # To be safer numerically, do a log-sum-exp:
+    max_logp = max(label2logp.values())
+    sum_exp = 0.0
+    for val in label2logp.values():
+        sum_exp += math.exp(val - max_logp)
+
+    label2prob = {}
+    for label_str, logp in label2logp.items():
+        label2prob[label_str] = math.exp(logp - max_logp) / sum_exp
+
+    return label2prob
 
 @dataclass
 class InferenceModel:
@@ -269,4 +489,21 @@ class InferenceModel:
             target_colname=target_colname,
             target_choices=target_choices,
             **kwargs,
+        )
+    
+    def predict_proba(
+        self,
+        target_example: pd.DataFrame,
+        target_colname: str,
+        target_choices: List[str],
+        **kwargs,
+    ):
+        return infer_label_distribution_on_example(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            serializer=self.serializer,
+            target_example=target_example,
+            target_colname=target_colname,
+            target_choices=target_choices,
+            **kwargs,       
         )
