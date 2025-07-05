@@ -1,16 +1,17 @@
 #!/bin/bash
-# Change to the repository root (two levels up from scripts/tests)
-cd "$(dirname "$0")/../.."
 
-pwd 
+# Activate the conda environment
+source /apps/anaconda3/etc/profile.d/conda.sh
+conda activate rtfm
+
 # Set the CUDA devices to use
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,3,4,6
 
 # Run the command
 torchrun --nproc_per_node=4 --standalone \
     -m rtfm.finetune \
-    --train-task-file "./sampledata/v6.0.3-serialized/train/train-files.txt" \
-    --eval-task-file  "./sampledata/v6.0.3-serialized/train/traineval-files.txt" \
+    --train-task-file "/user/bh2976/FoundationalTabularBandits/sampledata/new-train-files.txt" \
+    --eval-task-file  "/user/bh2976/FoundationalTabularBandits/sampledata/new-traineval-files.txt" \
     --run_validation "False" \
     --use_wandb "True" \
     --wandb_project "llama_recipes" \
